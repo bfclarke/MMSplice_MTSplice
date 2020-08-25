@@ -1,11 +1,126 @@
 import logging
 import pandas as pd
+import numpy as np
 from kipoiseq.dataclasses import Interval, Variant
 from kipoi.data import Dataset
 from kipoiseq.extractors import VariantSeqExtractor
 from mmsplice.utils import encodeDNA
 
+from pyfaidx import Fasta, FastaVariant
+from cyvcf2 import VCF
+from allel import read_vcf, read_vcf_headers
+
 logger = logging.getLogger('mmsplice')
+
+
+class PyfaidxSeqExtractor:
+    def __init__(self, fasta_file, vcf_file):
+        # TODO: Get separate sequences for each phase
+        self.fasta_variants = {
+            sample: FastaVariant(
+                fasta_file,
+                vcf_file,
+                sample=sample,
+                het=True,
+                hom=True
+            )
+            for sample in read_vcf_headers(vcf_file).samples
+        }
+
+        self.fasta = Fasta(fasta_file)
+
+    def extract(self, interval, sample, anchor=0, fixed_len=True, strand='+'):
+        # TODO: Take anchor and fixed_len into account
+        extractor = self.fasta_variants.get(sample, self.fasta)
+        # __import__("pdb").set_trace()
+        # try:
+        consensus = extractor[interval.chrom][interval.start:interval.end]
+        # except ValueError:
+        #     __import__("pdb").set_trace()
+        if strand == '-':
+            consensus = consensus.complement.reverse
+
+        return consensus.seq
+
+
+# TODO: Rewrite this with VariantSeqExtractor for extract(), cyvcf2 for VCF file
+class MySeqExtractor():
+    def __init__(self, fasta_file, vcf_file):
+        # TODO: Get separate sequences for each phase
+        self.fasta = Fasta(fasta_file)
+        self.vcf = read_vcf(vcf_file, alt_number=1)
+        # TODO: Is the next line correct?
+        self.vcf['variants/POS'] -= 1  # Convert to 0-based
+        self.samples = dict(zip(self.vcf['samples'],
+                                range(len(self.vcf['samples']))))
+
+    def extract(self, interval, sample, phase,
+                anchor=0, fixed_len=True, strand='+'):
+        # TODO: Take anchor and fixed_len into account
+        consensus = self.fasta[interval.chrom][interval.start:interval.end]
+
+        if sample is not None:
+            # TODO: Precompute/cache variants relevant to each exon/interval?
+            indices = np.where(np.all(np.stack([
+                self.vcf['variants/POS'] >= interval.start,
+                self.vcf['variants/POS'] < interval.end  # TODO: Should this be <= ?
+            ]), axis=0))
+            sample_index = self.samples[sample]
+            phased_gt = [
+                i for i in indices
+                if self.vcf['calldata/GT'][i, sample, phase] == 1]
+            # TODO: Convert consensus to list, replace where variants present, convert back to string
+            consensus_list = list(consensus)
+            for i in phased_gt:
+                consensus_list[self.vcf['variants/POS'][i]] = self.vcf['variants/ALT']
+
+        if strand == '-':
+            # TODO: Implement this
+            pass
+
+        return consensus
+
+    @staticmethod
+    def reverse_complement(seq):
+        # TODO: Implement
+        pass
+
+
+class SampleSeqExtractor(VariantSeqExtractor):
+    def __init__(self, fasta_file, vcf_file):
+        self.vcf = VCF(vcf_file)
+        self.sample_indices = dict(zip(self.vcf.samples,
+                                       range(len(self.vcf.samples))))
+
+        super().__init__(fasta_file)
+
+    def extract(self, interval, sample, phase, anchor,
+                fixed_len=True, **kwargs):
+        variants = []
+        if sample is not None:
+            if phase not in (0, 1):
+                logger.error('phase argument must be in (0, 1)'
+                             + 'if sample is not None')
+
+            # Interval is  0-based, cyvcf2 positions are 1-based: need to add 1
+            variants = self.get_sample_variants(
+                self.vcf(
+                    f'{interval.chrom}:'
+                    + f'{interval.start + 1}-{interval.end + 1}'
+                ),
+                sample,
+                phase
+            )
+
+        return super(SampleSeqExtractor, self).extract(
+            interval, variants, anchor, fixed_len, **kwargs)
+
+    def get_sample_variants(self, variants, sample, phase):
+        sample_index = self.sample_indices[sample]
+        return [
+            Variant.from_cyvcf(v) for v in variants
+            if v.genotypes[sample_index][phase]
+        ]
 
 
 class ExonVariantSeqExtrator:
@@ -17,16 +132,18 @@ class ExonVariantSeqExtrator:
     for indels.
     """
 
-    def __init__(self, fasta_file):
-        self.variant_seq_extractor = VariantSeqExtractor(fasta_file)
-        self.fasta = self.variant_seq_extractor.fasta
+    def __init__(self, fasta_file, vcf_file):
+        self.variant_seq_extractor = SampleSeqExtractor(fasta_file, vcf_file)
+        # self.fasta = self.variant_seq_extractor.fasta
 
-    def extract(self, interval, variants, sample_id=None, overhang=(100, 100)):
+    def extract(self, interval, sample_id=None, phase=None,
+                overhang=(100, 100)):
         """
         Args:
           interval (pybedtools.Interval): zero-based interval of exon
             without overhang.
         """
+
         down_interval = Interval(
             interval.chrom, interval.start - overhang[0],
             interval.start, strand=interval.strand)
@@ -34,13 +151,22 @@ class ExonVariantSeqExtrator:
             interval.chrom, interval.end,
             interval.end + overhang[1], strand=interval.strand)
 
+        # DEBUG
+        # print(f'Extracting down_seq for {down_interval}')
         down_seq = self.variant_seq_extractor.extract(
-            down_interval, variants, anchor=interval.start)
+            down_interval, sample_id, phase, anchor=interval.start)
+        # DEBUG
+        # print(f'Extracting up_seq for {up_interval}')
         up_seq = self.variant_seq_extractor.extract(
-            up_interval, variants, anchor=interval.start)
+            up_interval, sample_id, phase, anchor=interval.start)
 
+        # DEBUG
+        # print(f'Extracting exon_seq for {interval}')
+        # DEBUG
+        if interval.start >= interval.end:
+            __import__("pdb").set_trace()
         exon_seq = self.variant_seq_extractor.extract(
-            interval, variants, anchor=0, fixed_len=False)
+            interval, sample_id, phase, anchor=0, fixed_len=False)
 
         if interval.strand == '-':
             down_seq, up_seq = up_seq, down_seq
@@ -216,7 +342,7 @@ class ExonSplicingMixin:
     optional_metadata = ('exon_id', 'gene_id', 'gene_name',
                          'transcript_id', 'junction', 'side')
 
-    def __init__(self, fasta_file, split_seq=True, encode=True,
+    def __init__(self, fasta_file, vcf_file, split_seq=True, encode=True,
                  overhang=(100, 100), seq_spliter=None,
                  tissue_specific=False, tissue_overhang=(300, 300)):
         self.fasta_file = fasta_file
@@ -224,20 +350,29 @@ class ExonSplicingMixin:
         self.encode = encode
         self.overhang = overhang
         self.spliter = seq_spliter or SeqSpliter()
-        self.vseq_extractor = ExonVariantSeqExtrator(fasta_file)
-        self.fasta = self.vseq_extractor.fasta
+        self.vseq_extractor = ExonVariantSeqExtrator(fasta_file, vcf_file)
+        # self.fasta = self.vseq_extractor.fasta
         self.tissue_specific = tissue_specific
         self.tissue_overhang = tissue_overhang
 
-    def _next(self, exon, variant, overhang=None, mask_module=None):
+    def _next(self, exon, sample, phase, overhang=None, mask_module=None):
         overhang = overhang or self.overhang
 
         inputs = {
-            'seq': self.fasta.extract(Interval(
-                exon.chrom, exon.start - overhang[0],
-                exon.end + overhang[1], strand=exon.strand)).upper(),
+            'seq': self.vseq_extractor.extract(
+                Interval(
+                    exon.chrom, exon.start - overhang[0],
+                    exon.end + overhang[1], strand=exon.strand
+                ),
+            ).upper(),
             'mut_seq': self.vseq_extractor.extract(
-                exon, [variant], overhang=overhang).upper()
+                Interval(
+                    exon.chrom, exon.start - overhang[0],
+                    exon.end + overhang[1], strand=exon.strand
+                ),
+                sample_id=sample,
+                phase=phase
+            ).upper()
         }
 
         if self.tissue_specific:
@@ -246,7 +381,8 @@ class ExonSplicingMixin:
                 0 if overhang[1] == 0 else self.tissue_overhang[1]
             )
             inputs['tissue_seq'] = self.vseq_extractor.extract(
-                exon, [variant], overhang=tissue_overhang).upper()
+                exon, sample, overhang=tissue_overhang,
+                sample_id=sample, phase=phase).upper()
 
         if exon.strand == '-':
             overhang = (overhang[1], overhang[0])
@@ -274,8 +410,9 @@ class ExonSplicingMixin:
         return {
             'inputs': inputs,
             'metadata': {
-                'variant': self._variant_to_dict(variant),
-                'exon': self._exon_to_dict(exon, overhang)
+                'exon': self._exon_to_dict(exon, overhang),
+                'sample': sample,
+                'phase': phase
             }
         }
 
@@ -313,16 +450,20 @@ class ExonSplicingMixin:
         }
 
     def _exon_to_dict(self, exon, overhang):
-        return {
-            'chrom': exon.chrom,
-            'start': exon.start,
-            'end': exon.end,
-            'strand': exon.strand,
-            'left_overhang': overhang[0],
-            'right_overhang': overhang[1],
-            'annotation': str(exon),
-            **exon.attrs
-        }
+        # return {
+        #     'chrom': exon.chrom,
+        #     'start': exon.start,
+        #     'end': exon.end,
+        #     'strand': exon.strand,
+        #     'gene_id': None,
+        #     'exon_id': None,
+        #     'transcript_id': None,
+        #     'left_overhang': overhang[0],
+        #     'right_overhang': overhang[1],
+        #     'annotation': str(exon),
+        #     **exon.attrs
+        # }
+        return dict(exon)
 
 
 class ExonDataset(ExonSplicingMixin, Dataset):

@@ -7,6 +7,9 @@ from kipoiseq.extractors import MultiSampleVCF, SingleVariantMatcher
 from mmsplice.utils import pyrange_remove_chr_from_chrom_annotation
 from mmsplice.exon_dataloader import ExonSplicingMixin
 
+from allel import read_vcf_headers
+from pyfaidx import Fasta
+
 logger = logging.getLogger('mmsplice')
 
 prebuild_annotation = {
@@ -55,13 +58,17 @@ class SplicingVCFMixin(ExonSplicingMixin):
                  overhang=(100, 100), seq_spliter=None,
                  tissue_specific=False, tissue_overhang=(300, 300),
                  interval_attrs=tuple()):
-        super().__init__(fasta_file, split_seq, encode, overhang, seq_spliter,
+        super().__init__(fasta_file, vcf_file, split_seq, encode,
+                         overhang, seq_spliter,
                          tissue_specific, tissue_overhang)
         self.pr_exons = pr_exons
         self.annotation = annotation
         self.vcf_file = vcf_file
+        self.fasta_file = fasta_file
         self.vcf = MultiSampleVCF(vcf_file)
+        self.vcf_chroms = set(self.vcf.seqnames)
         self._check_chrom_annotation()
+        # TODO: change to MultiVariantsMatcher?
         self.matcher = SingleVariantMatcher(
             vcf_file, pranges=self.pr_exons,
             interval_attrs=interval_attrs
@@ -69,22 +76,21 @@ class SplicingVCFMixin(ExonSplicingMixin):
         self._generator = iter(self.matcher)
 
     def _check_chrom_annotation(self):
-        fasta_chroms = set(self.fasta.fasta.keys())
-        vcf_chroms = set(self.vcf.seqnames)
+        fasta_chroms = set(Fasta(self.fasta_file).keys())
 
-        if not fasta_chroms.intersection(vcf_chroms):
+        if not fasta_chroms.intersection(self.vcf_chroms):
             raise ValueError(
                 'Fasta chrom names do not match with vcf chrom names')
 
         if self.annotation == 'grch37' or self.annotation == 'grch38':
             chr_annotaion = any(chrom.startswith('chr')
-                                for chrom in vcf_chroms)
+                                for chrom in self.vcf_chroms)
             if not chr_annotaion:
                 self.pr_exons = pyrange_remove_chr_from_chrom_annotation(
                     self.pr_exons)
 
         gtf_chroms = set(self.pr_exons.Chromosome)
-        if not gtf_chroms.intersection(vcf_chroms):
+        if not gtf_chroms.intersection(self.vcf_chroms):
             raise ValueError(
                 'GTF chrom names do not match with vcf chrom names')
 
@@ -116,12 +122,30 @@ class SplicingVCFDataloader(SplicingVCFMixin, SampleIterator):
                  overhang=(100, 100), seq_spliter=None,
                  tissue_specific=False, tissue_overhang=(300, 300)):
         pr_exons = self._read_exons(gtf, overhang)
+        self.vcf = MultiSampleVCF(vcf_file)
+        self.vcf_chroms = set(self.vcf.seqnames)
         super().__init__(pr_exons, gtf, fasta_file, vcf_file,
                          split_seq, encode, overhang, seq_spliter,
                          tissue_specific, tissue_overhang,
                          interval_attrs=('left_overhang', 'right_overhang',
                                          'exon_id', 'gene_id',
                                          'gene_name', 'transcript_id'))
+
+        self.samples = read_vcf_headers(vcf_file).samples
+        df_exons = pd.concat(
+            [pr_exons[chrom].as_df() for chrom in self.vcf_chroms]
+        )
+        self.df_exons = df_exons.rename(columns={
+            'Chromosome': 'chrom',
+            'Start': 'start',
+            'End': 'end',
+            'Strand': 'strand'
+        })
+        self._generator = (
+            (exon, sample, phase) for _, exon in self.df_exons.iterrows()
+            for sample in self.samples
+            for phase in (0, 1)
+        )
 
     def _read_exons(self, gtf, overhang=(100, 100)):
         if gtf in prebuild_annotation:
@@ -135,11 +159,12 @@ class SplicingVCFDataloader(SplicingVCFMixin, SampleIterator):
             return read_exon_pyranges(gtf, overhang=overhang)
 
     def __next__(self):
-        exon, variant = next(self._generator)
-        overhang = (exon.attrs['left_overhang'], exon.attrs['right_overhang'])
-        exon._start += overhang[0]
-        exon._end -= overhang[1]
-        return self._next(exon, variant, overhang)
+        exon, sample, phase = next(self._generator)
+        overhang = (exon.left_overhang, exon.right_overhang)
+        exon = exon.copy()
+        exon.start += overhang[0]
+        exon.end -= overhang[1]
+        return self._next(exon, sample, phase, overhang)
 
     def __iter__(self):
         return self
