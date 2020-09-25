@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 from kipoiseq.dataclasses import Interval, Variant
 from kipoi.data import Dataset
-from kipoiseq.extractors import VariantSeqExtractor
+from kipoiseq.extractors import VariantSeqExtractor, SampleSeqExtractor
 from mmsplice.utils import encodeDNA
 
 from pyfaidx import Fasta, FastaVariant
@@ -86,41 +86,41 @@ class MySeqExtractor():
         pass
 
 
-class SampleSeqExtractor(VariantSeqExtractor):
-    def __init__(self, fasta_file, vcf_file):
-        self.vcf = VCF(vcf_file)
-        self.sample_indices = dict(zip(self.vcf.samples,
-                                       range(len(self.vcf.samples))))
+# class SampleSeqExtractor(VariantSeqExtractor):
+#     def __init__(self, fasta_file, vcf_file):
+#         self.vcf = VCF(vcf_file)
+#         self.sample_indices = dict(zip(self.vcf.samples,
+#                                        range(len(self.vcf.samples))))
 
-        super().__init__(fasta_file)
+#         super().__init__(fasta_file)
 
-    def extract(self, interval, sample, phase, anchor,
-                fixed_len=True, **kwargs):
-        variants = []
-        if sample is not None:
-            if phase not in (0, 1):
-                logger.error('phase argument must be in (0, 1)'
-                             + 'if sample is not None')
+#     def extract(self, interval, sample, phase, anchor,
+#                 fixed_len=True, **kwargs):
+#         variants = []
+#         if sample is not None:
+#             if phase not in (0, 1):
+#                 logger.error('phase argument must be in (0, 1)'
+#                              + 'if sample is not None')
 
-            # Interval is  0-based, cyvcf2 positions are 1-based: need to add 1
-            variants = self.get_sample_variants(
-                self.vcf(
-                    f'{interval.chrom}:'
-                    + f'{interval.start + 1}-{interval.end + 1}'
-                ),
-                sample,
-                phase
-            )
+#             # Interval is  0-based, cyvcf2 positions are 1-based: need to add 1
+#             variants = self.get_sample_variants(
+#                 self.vcf(
+#                     f'{interval.chrom}:'
+#                     + f'{interval.start + 1}-{interval.end + 1}'
+#                 ),
+#                 sample,
+#                 phase
+#             )
 
-        return super(SampleSeqExtractor, self).extract(
-            interval, variants, anchor, fixed_len, **kwargs)
+#         return super(SampleSeqExtractor, self).extract(
+#             interval, variants, anchor, fixed_len, **kwargs)
 
-    def get_sample_variants(self, variants, sample, phase):
-        sample_index = self.sample_indices[sample]
-        return [
-            Variant.from_cyvcf(v) for v in variants
-            if v.genotypes[sample_index][phase]
-        ]
+#     def get_sample_variants(self, variants, sample, phase):
+#         sample_index = self.sample_indices[sample]
+#         return [
+#             Variant.from_cyvcf(v) for v in variants
+#             if v.genotypes[sample_index][phase]
+#         ]
 
 
 class ExonVariantSeqExtrator:
@@ -132,9 +132,8 @@ class ExonVariantSeqExtrator:
     for indels.
     """
 
-    def __init__(self, fasta_file, vcf_file):
-        self.variant_seq_extractor = SampleSeqExtractor(fasta_file, vcf_file)
-        # self.fasta = self.variant_seq_extractor.fasta
+    def __init__(self, fasta_file, variants_file):
+        self.variant_seq_extractor = SampleSeqExtractor(fasta_file, variants_file)
 
     def extract(self, interval, sample_id=None, phase=None,
                 overhang=(100, 100)):
@@ -321,6 +320,7 @@ class SeqSpliter:
         }
 
 
+# TODO: Change to also accept BGEN
 class ExonSplicingMixin:
     """
     Dataloader to run mmsplice on specific set of variant-exon pairs.
@@ -342,7 +342,7 @@ class ExonSplicingMixin:
     optional_metadata = ('exon_id', 'gene_id', 'gene_name',
                          'transcript_id', 'junction', 'side')
 
-    def __init__(self, fasta_file, vcf_file, split_seq=True, encode=True,
+    def __init__(self, fasta_file, variant_file, split_seq=True, encode=True,
                  overhang=(100, 100), seq_spliter=None,
                  tissue_specific=False, tissue_overhang=(300, 300)):
         self.fasta_file = fasta_file
@@ -350,7 +350,7 @@ class ExonSplicingMixin:
         self.encode = encode
         self.overhang = overhang
         self.spliter = seq_spliter or SeqSpliter()
-        self.vseq_extractor = ExonVariantSeqExtrator(fasta_file, vcf_file)
+        self.vseq_extractor = ExonVariantSeqExtrator(fasta_file, variant_file)
         # self.fasta = self.vseq_extractor.fasta
         self.tissue_specific = tissue_specific
         self.tissue_overhang = tissue_overhang
@@ -530,7 +530,7 @@ class ExonDataset(ExonSplicingMixin, Dataset):
 
         if not fasta_chroms.intersection(exon_chroms):
             raise ValueError(
-                'Fasta chrom names do not match with vcf chrom names')
+                'Fasta chrom names do not match with variant file chrom names')
 
         for c in self.required_cols:
             if c not in self.exons.columns:

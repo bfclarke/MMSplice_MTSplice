@@ -52,45 +52,56 @@ def read_exon_pyranges(gtf_file, overhang=(100, 100), first_last=True):
 
 
 class SplicingVCFMixin(ExonSplicingMixin):
-
-    def __init__(self, pr_exons, annotation, fasta_file, vcf_file,
+    def __init__(self, pr_exons, annotation, fasta_file, variant_file,
                  split_seq=True, encode=True,
                  overhang=(100, 100), seq_spliter=None,
                  tissue_specific=False, tissue_overhang=(300, 300),
                  interval_attrs=tuple()):
-        super().__init__(fasta_file, vcf_file, split_seq, encode,
+        super().__init__(fasta_file, variant_file, split_seq, encode,
                          overhang, seq_spliter,
                          tissue_specific, tissue_overhang)
         self.pr_exons = pr_exons
         self.annotation = annotation
-        self.vcf_file = vcf_file
+        self.variant_file = variant_file
         self.fasta_file = fasta_file
-        self.vcf = MultiSampleVCF(vcf_file)
-        self.vcf_chroms = set(self.vcf.seqnames)
+
+        # TODO: This is quite the hack!
+        try:
+            self.variants
+        except NameError:
+            self.variants = MultiSampleVCF(variant_file)
+
+        # TODO: This is quite the hack!
+        try:
+            self.variants_chroms
+        except NameError:
+            self.variants_chroms = self.variants.seqnames
+
         self._check_chrom_annotation()
         # TODO: change to MultiVariantsMatcher?
         self.matcher = SingleVariantMatcher(
-            vcf_file, pranges=self.pr_exons,
+            variant_file, pranges=self.pr_exons,
             interval_attrs=interval_attrs
         )
         self._generator = iter(self.matcher)
 
     def _check_chrom_annotation(self):
         fasta_chroms = set(Fasta(self.fasta_file).keys())
+        variants_chroms = set(self.variants_chroms)
 
-        if not fasta_chroms.intersection(self.vcf_chroms):
+        if not fasta_chroms.intersection(variants_chroms):
             raise ValueError(
                 'Fasta chrom names do not match with vcf chrom names')
 
         if self.annotation == 'grch37' or self.annotation == 'grch38':
             chr_annotaion = any(chrom.startswith('chr')
-                                for chrom in self.vcf_chroms)
+                                for chrom in variants_chroms)
             if not chr_annotaion:
                 self.pr_exons = pyrange_remove_chr_from_chrom_annotation(
                     self.pr_exons)
 
         gtf_chroms = set(self.pr_exons.Chromosome)
-        if not gtf_chroms.intersection(self.vcf_chroms):
+        if not gtf_chroms.intersection(variants_chroms):
             raise ValueError(
                 'GTF chrom names do not match with vcf chrom names')
 
@@ -117,23 +128,35 @@ class SplicingVCFDataloader(SplicingVCFMixin, SampleIterator):
         tissue specific model.
     """
 
-    def __init__(self, gtf, fasta_file, vcf_file,
+    def __init__(self, gtf, fasta_file, variant_file,
                  split_seq=True, encode=True,
                  overhang=(100, 100), seq_spliter=None,
                  tissue_specific=False, tissue_overhang=(300, 300)):
         pr_exons = self._read_exons(gtf, overhang)
-        self.vcf = MultiSampleVCF(vcf_file)
-        self.vcf_chroms = set(self.vcf.seqnames)
-        super().__init__(pr_exons, gtf, fasta_file, vcf_file,
+
+        variant_file_type = self._check_variant_file_type(variant_file)
+        if variant_file_type == 'unknown':
+            raise ValueError(
+                'variant_file must be of type ybgen, vcf, or vcf.gz')
+
+        if variant_file_type == 'vcf':
+            self.variants = MultiSampleVCF(variant_file)
+            self.variants_chroms = set(self.variants.seqnames)
+            self.samples = read_vcf_headers(variant_file).samples
+        else:
+            self.variants = MultiSampleBGEN(variant_file)
+            self.variants_chroms = self.variants.chroms()
+            self.samples = self.variants.samples()
+
+        super().__init__(pr_exons, gtf, fasta_file, variant_file,
                          split_seq, encode, overhang, seq_spliter,
                          tissue_specific, tissue_overhang,
                          interval_attrs=('left_overhang', 'right_overhang',
                                          'exon_id', 'gene_id',
                                          'gene_name', 'transcript_id'))
 
-        self.samples = read_vcf_headers(vcf_file).samples
         df_exons = pd.concat(
-            [pr_exons[chrom].as_df() for chrom in self.vcf_chroms]
+            [pr_exons[chrom].as_df() for chrom in self.variants_chroms]
         )
         self.df_exons = df_exons.rename(columns={
             'Chromosome': 'chrom',
@@ -157,6 +180,18 @@ class SplicingVCFDataloader(SplicingVCFMixin, SampleIterator):
             return pyranges.PyRanges(df)
         else:
             return read_exon_pyranges(gtf, overhang=overhang)
+
+    @staticmethod
+    def _check_variant_file_type(variant_file):
+        split_name = variant_file.split('.')
+        ext1 = split_name[-1] if len(split_name) >= 2 else None
+        ext2 = split_name[-2] if len(split_name) >= 3 else None
+        if ext1 == 'bgen':
+            return 'bgen'
+        elif ext1 == 'vcf' or (ext1 == 'gz' and ext2 == 'vcf'):
+            return 'vcf'
+        else:
+            return 'unknown'
 
     def __next__(self):
         exon, sample, phase = next(self._generator)
